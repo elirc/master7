@@ -1,0 +1,475 @@
+# High-Reasoning Review Journal
+
+Date: 2026-05-05
+
+Scope reviewed:
+
+- Chat history and intended learning process
+- Root workspace setup
+- API services, routes, auth, policies, observability, tests, and in-memory store
+- React/Vite frontend
+- Prisma schema
+- Domain and contract packages
+- Architecture journal, forward plan, feature docs, and code walkthroughs
+
+This file records review conclusions and rationale. It does not include private scratch reasoning; it is written as a teaching artifact a junior developer can read.
+
+## Executive Summary
+
+The project is directionally good as a learning codebase. The documentation-first process, modular monolith shape, domain vocabulary, and feature journals are all worth keeping.
+
+With a stricter review pass, I would change the next development sequence. I would not continue adding many product features immediately. I would first create a remediation slice that fixes authorization leaks, data-model mismatches, and documentation drift. Then I would move persistence into Prisma earlier than the current implemented feature order.
+
+The main reason: the app has started to grow beyond a demo scaffold, but several shortcuts now risk teaching the wrong lessons if left in place.
+
+## Highest-Priority Findings
+
+### 1. Dashboard Responses Leak Cross-Tenant And Cross-Learner Data
+
+Files:
+
+- `apps/api/src/services.ts`, lines 24-28
+- `apps/api/src/services.ts`, lines 206-214
+
+Current behavior:
+
+- Non-learner dashboard responses include all quiz attempts.
+- Non-learner dashboard responses include all assignment submissions.
+- All dashboard responses include all certificates.
+- Reporting uses all quiz attempts when calculating average quiz score, not only attempts visible to the actor's organization.
+
+Why this matters:
+
+This undermines one of the central enterprise SaaS lessons: tenant boundaries must be enforced on the backend for every derived view, not only for primary list endpoints. A platform admin can cross tenants, but an organization admin or instructor should not see another organization's learner records.
+
+What I would change:
+
+- Make dashboard assembly use explicit scoped query helpers.
+- Filter quiz attempts, assignment submissions, certificates, and reports through visible course versions/enrollments.
+- Add tests for Acme admin/instructor not seeing Nova records.
+- Add tests for learners not seeing other learners' certificates.
+
+Recommended feature slice:
+
+- `08 - Data Scoping And Dashboard Isolation Hardening`
+
+### 2. Transcript Endpoint Returns The Full User Object, Including Demo Password
+
+File:
+
+- `apps/api/src/services.ts`, lines 53-55
+
+Current behavior:
+
+`services.transcript` returns `learner: store.users.find(...)`. In the in-memory store, `User` includes a `password` field. That means the transcript response can leak password data.
+
+Why this matters:
+
+Even though the passwords are demo values, this teaches a bad DTO habit. Service responses should shape safe response objects, not return persistence records directly.
+
+What I would change:
+
+- Return `learner: { id, name, email, organizationId }`.
+- Never return password or passwordHash from service response DTOs.
+- Add a test asserting transcript JSON does not include `password`.
+
+Recommended feature slice:
+
+- Include in `08 - Data Scoping And Dashboard Isolation Hardening`
+
+### 3. Quiz And Assignment Submission Workflows Do Not Check Enrollment Or Tenant Access
+
+Files:
+
+- `apps/api/src/services.ts`, lines 147-155
+- `apps/api/src/services.ts`, lines 157-163
+
+Current behavior:
+
+Any authenticated actor can submit a quiz attempt or assignment submission if they know the quiz or assignment ID. The service does not verify that:
+
+- The actor is a learner.
+- The actor belongs to the course organization.
+- The actor is enrolled in the course version.
+- The quiz/assignment belongs to the version the learner is taking.
+
+Why this matters:
+
+This violates the project's core business rule that learning records should belong to enrollments and course versions. It also weakens tenant isolation.
+
+What I would change:
+
+- Require enrollment context for attempts and submissions.
+- Connect quiz attempts and assignment submissions to `enrollmentId`.
+- Enforce that quiz/assignment content belongs to the enrolled course version.
+- Add negative tests for cross-tenant and non-enrolled submissions.
+
+Recommended feature slice:
+
+- `09 - Enrollment-Scoped Attempts And Submissions`
+
+### 4. Lesson Completion Accepts Any Lesson ID For An Enrollment
+
+File:
+
+- `apps/api/src/services.ts`, lines 132-145
+
+Current behavior:
+
+`completeLesson` checks that the actor owns the enrollment, but it does not check that the lesson belongs to the course version attached to that enrollment.
+
+Why this matters:
+
+Progress records are supposed to be durable learning evidence. If any lesson ID can be attached to any enrollment, progress becomes unreliable.
+
+What I would change:
+
+- Resolve the enrollment's course version.
+- Verify `lessonId` is included in that version's lesson set.
+- Reject lesson IDs outside the enrolled version.
+- Add a regression test.
+
+Recommended feature slice:
+
+- Include in `09 - Enrollment-Scoped Attempts And Submissions`
+
+### 5. Seeded Certificate Violates Completion Invariants
+
+File:
+
+- `apps/api/src/store.ts`, certificate seed near the bottom of the store
+
+Current behavior:
+
+The seeded certificate is `ISSUED`, but the seeded enrollment is `ACTIVE`, only one lesson is completed, and no quiz/assignment records satisfy the certificate rule.
+
+Why this matters:
+
+This contradicts the domain rule in `issueCertificateInput`. For a learning repo, inconsistent seed data is especially harmful because learners use seed records to infer how the system is supposed to work.
+
+What I would change:
+
+- Either seed all durable records needed for a legitimately issued certificate, or make the seeded certificate `PENDING`.
+- Prefer the first option because certificate verification is easier to demo with a valid issued certificate.
+- Add a seed consistency test.
+
+Recommended feature slice:
+
+- `10 - Seed Data Consistency And Fixture Discipline`
+
+## Data Model Findings
+
+### 6. Prisma Schema Does Not Fully Protect Course Versioning
+
+File:
+
+- `packages/database/prisma/schema.prisma`, lines 115-124
+
+Current behavior:
+
+`CourseVersion` stores title, summary, and version number, but it does not snapshot modules, lessons, quiz definitions, assignments, or version content. The in-memory store has `lessonIds`, but the Prisma model does not.
+
+Why this matters:
+
+One of the most important LMS modeling rules is that learners take a specific course version. If a published version does not snapshot content, future draft edits can make historical progress ambiguous.
+
+What I would change:
+
+- Introduce versioned content tables or snapshot JSON for published course versions.
+- Make enrollments, lesson progress, quiz attempts, and assignment submissions point to versioned content IDs.
+- Decide whether drafts and published versions share content tables or use publish-time snapshots. For teaching, publish-time snapshots are easier to reason about.
+
+Recommended feature slice:
+
+- `11 - Published Course Version Snapshot Model`
+
+### 7. Prisma Schema Has Scalar Foreign-Key-Like Fields Without Relations
+
+File:
+
+- `packages/database/prisma/schema.prisma`
+
+Examples:
+
+- `Quiz.courseId`
+- `Assignment.courseId`
+
+Current behavior:
+
+These fields look like foreign keys but are not declared as Prisma relations to `Course`.
+
+Why this matters:
+
+The schema currently validates, but it does not enforce referential integrity for those relationships. A realistic enterprise schema should make important relationships explicit.
+
+What I would change:
+
+- Add relations from `Quiz` to `Course`.
+- Add relations from `Assignment` to `Course`.
+- Add indexes for common tenant/reporting lookups.
+- Add uniqueness constraints such as one progress record per enrollment/lesson and likely one active enrollment per learner/course version.
+
+Recommended feature slice:
+
+- Include in `11 - Published Course Version Snapshot Model` or a dedicated `Prisma Schema Hardening` slice.
+
+### 8. IDs Are Random Strings Without Collision Strategy
+
+File:
+
+- `apps/api/src/services.ts`, line 7
+
+Current behavior:
+
+IDs use `Math.random().toString(36)`.
+
+Why this matters:
+
+This is acceptable for a temporary demo but not for a codebase intended to teach production-shaped patterns. It also makes tests less deterministic.
+
+What I would change:
+
+- Use `crypto.randomUUID()` for runtime IDs.
+- Use stable fixture builders for tests.
+- Let the database own UUID defaults once Prisma persistence arrives.
+
+Recommended feature slice:
+
+- Include in `10 - Seed Data Consistency And Fixture Discipline`
+
+## API And Error Handling Findings
+
+### 9. Many Errors Are Mapped To 403 Regardless Of Cause
+
+File:
+
+- `apps/api/src/index.ts`, lines 47-98
+
+Current behavior:
+
+Several routes catch any service error and return `403`. Not-found, validation, conflict, and forbidden errors are collapsed into one status.
+
+Why this matters:
+
+Correct status codes are part of the API contract. A junior developer should learn to distinguish authorization failures from missing records and invalid transitions.
+
+What I would change:
+
+- Add typed application errors: `ForbiddenError`, `NotFoundError`, `ConflictError`, `ValidationError`.
+- Add one Express error middleware.
+- Keep route handlers thin and remove repeated `try/catch` blocks.
+- Add tests for status-code mapping.
+
+Recommended feature slice:
+
+- `12 - Typed API Errors And Error Middleware`
+
+### 10. Some Route Handlers Still Let Service Exceptions Become 500s
+
+File:
+
+- `apps/api/src/index.ts`, lines 81-89
+
+Current behavior:
+
+`/quiz-attempts` and `/assignment-submissions` do not catch service errors. Missing quiz/assignment records can become unshaped 500 responses.
+
+Why this matters:
+
+This inconsistency makes API behavior harder to learn and harder to test.
+
+What I would change:
+
+- Same answer as finding 9: typed errors plus central error middleware.
+
+## Authentication And Security Findings
+
+### 11. Demo Passwords And Token Storage Need Stronger Boundaries In Docs And Code
+
+Files:
+
+- `apps/api/src/store.ts`, seeded users
+- `apps/api/src/services.ts`, lines 10-12
+- `apps/web/src/main.tsx`, lines 31 and 49
+
+Current behavior:
+
+The demo store has plaintext passwords. The frontend stores JWTs in `localStorage`. The config package has a default local JWT secret.
+
+Why this matters:
+
+This is fine for a learning scaffold only if the repo makes that boundary impossible to miss. Otherwise, future readers may normalize insecure patterns.
+
+What I would change:
+
+- Rename seeded password fields to make the demo nature clear, or hash them even in the seed.
+- Move auth to a dedicated auth service.
+- Add a `SECURITY_NOTES.md`.
+- Use `.env.example` and require explicit `JWT_SECRET` outside development.
+- Eventually move tokens to httpOnly cookies or document why bearer/localStorage is a development simplification.
+
+Recommended feature slice:
+
+- `13 - Authentication Hardening And Security Notes`
+
+## Testing Findings
+
+### 12. Tests Share A Mutable Global Store
+
+Files:
+
+- `apps/api/src/api.test.ts`, lines 4-14
+- `apps/api/src/store.ts`
+
+Current behavior:
+
+Each test creates a new Express app, but all apps share the same imported in-memory store. Tests that mutate state can affect later tests.
+
+Why this matters:
+
+Order-dependent tests are a common enterprise codebase failure mode. They make debugging harder and teach the wrong lesson about isolation.
+
+What I would change:
+
+- Add `createDemoStore()` factory.
+- Inject the store into `createApp`.
+- Reset fixtures before each test.
+- Move from global `services` to service factories that receive repositories.
+
+Recommended feature slice:
+
+- `14 - Test Fixture Isolation And App Factory Refactor`
+
+### 13. Verification Lacks Browser Workflow Tests
+
+File:
+
+- Root scripts and current test set
+
+Current behavior:
+
+The API has useful smoke tests and policy tests, but the frontend workflows are not covered by Playwright.
+
+Why this matters:
+
+The project goal includes learning to maintain a realistic app. Browser tests teach how API, UI, and role boundaries behave together.
+
+What I would change:
+
+- Add one Playwright test for role login and learner dashboard.
+- Add one Playwright test for certificate verification.
+- Add one Playwright test that confirms learner audit logs remain hidden.
+
+Recommended feature slice:
+
+- `15 - Browser Workflow Tests`
+
+## Frontend Findings
+
+### 14. `apps/web/src/main.tsx` Is Now Too Large For The Teaching Goal
+
+File:
+
+- `apps/web/src/main.tsx`
+
+Current behavior:
+
+The frontend is a single component containing types, API client code, auth state, dashboard loading, learner actions, admin actions, certificate verification, and rendering.
+
+Why this matters:
+
+It was acceptable for the first slice, but continuing to add features here will create the exact "giant file" anti-pattern the project is supposed to teach people to avoid.
+
+What I would change:
+
+- Split into `api/client.ts`, `auth/useSession.ts`, and feature components.
+- Add small typed view models.
+- Keep role-specific panels in separate files.
+
+Recommended feature slice:
+
+- `16 - Frontend Module Split`
+
+## Documentation Findings
+
+### 15. The Forward Backlog No Longer Matches Implemented Feature Order
+
+File:
+
+- `docs/SYSTEM_DESIGN_FORWARD_PLAN.md`, backlog section
+
+Current behavior:
+
+The forward plan still lists earlier intended backlog ordering. Implemented features 03-07 diverged from the listed order.
+
+Why this matters:
+
+The project's explicit goal is a chronological trail. The feature docs are correct, but the forward plan should also distinguish "original candidate backlog" from "actual implemented order" and "next recommended order."
+
+What I would change:
+
+- Add a current feature ledger to the forward plan.
+- Keep the original backlog as a candidate backlog.
+- Add a re-sequenced "next 10" based on this review.
+
+Recommended feature slice:
+
+- `17 - Documentation Ledger And Backlog Reconciliation`
+
+### 16. Build Artifacts Are Present In The Working Tree
+
+Files:
+
+- `apps/*/tsconfig.tsbuildinfo`
+- `packages/*/tsconfig.tsbuildinfo`
+
+Current behavior:
+
+TypeScript build info files exist in the workspace. `.gitignore` does not currently ignore `*.tsbuildinfo`.
+
+Why this matters:
+
+These are generated artifacts and should not become part of the learning source trail.
+
+What I would change:
+
+- Add `*.tsbuildinfo` to `.gitignore`.
+- Remove generated build-info files from source control if a git repo is initialized later.
+
+Recommended feature slice:
+
+- Include in `17 - Documentation Ledger And Backlog Reconciliation` or do as a quick housekeeping change.
+
+## Process Recommendation
+
+I would change the next sequence from "keep adding LMS features" to this:
+
+1. `08 - Data Scoping And Dashboard Isolation Hardening`
+2. `09 - Enrollment-Scoped Attempts And Submissions`
+3. `10 - Seed Data Consistency And Fixture Discipline`
+4. `11 - Published Course Version Snapshot Model`
+5. `12 - Typed API Errors And Error Middleware`
+6. `13 - Authentication Hardening And Security Notes`
+7. `14 - Test Fixture Isolation And App Factory Refactor`
+8. `15 - Browser Workflow Tests`
+9. `16 - Frontend Module Split`
+10. `17 - Documentation Ledger And Backlog Reconciliation`
+
+After those, I would resume product expansion with assignment rubrics, grading queues, quiz question banks, retake policies, due dates, prerequisites, learning paths, cohort workflows, notifications, and reporting.
+
+## What I Would Keep
+
+- Documentation-first feature process
+- Modular monolith direction
+- Shared domain package for reusable rules
+- Shared contract package for request validation
+- Policy layer direction
+- Code walkthrough docs
+- The idea of making simplifications explicit
+- The feature journal format
+
+## Final Review Conclusion
+
+The repo is a strong learning seed, but it has crossed the point where more features should not be layered onto the same shortcuts. The most senior move now is to pause, harden the boundaries, and make the next few features about correctness, isolation, persistence shape, and test discipline.
+
+That would better serve the original goal: learning how to understand, extend, maintain, debug, and reason about a realistic codebase.

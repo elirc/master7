@@ -1,0 +1,23 @@
+{
+  "project": "_Organized Desktop/03 Master Projects/master7",
+  "id": "a1d53294d3b0",
+  "command": [
+    "node",
+    "C:/Program Files/nodejs/node_modules/npm/bin/npm-cli.js",
+    "test",
+    "--",
+    "--pool=threads",
+    "--poolOptions.threads.singleThread=true",
+    "--testTimeout=30000"
+  ],
+  "cwd": "C:\\Users\\Owner\\Desktop\\AstraOrganized2\\astra-remaining-improvements\\stage\\a1d53294d3b0",
+  "environmentOverrides": {},
+  "startedAt": "2026-09-12T18:52:02.181030+00:00",
+  "status": "complete",
+  "log": "tests-root-01.log",
+  "pid": 32356,
+  "exitCode": 0,
+  "passed": true,
+  "finishedAt": "2026-09-12T18:52:28.353171+00:00",
+  "elapsedSeconds": 26.16
+}

@@ -1,0 +1,233 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  LEARNER
+  INSTRUCTOR
+  ORG_ADMIN
+  PLATFORM_ADMIN
+}
+
+enum CourseDraftStatus {
+  DRAFT
+  READY_FOR_REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum LessonProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum QuizAttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  GRADED
+}
+
+enum AssignmentSubmissionStatus {
+  DRAFT
+  SUBMITTED
+  GRADED
+  RETURNED
+}
+
+enum CertificateStatus {
+  PENDING
+  ISSUED
+  REVOKED
+}
+
+model Organization {
+  id          String   @id
+  name        String
+  slug        String   @unique
+  createdAt   DateTime @default(now())
+  users       User[]
+  courses     Course[]
+  auditLogs   AuditLog[]
+}
+
+model User {
+  id             String        @id
+  organizationId String?
+  email          String        @unique
+  name           String
+  passwordHash   String
+  role           Role
+  createdAt      DateTime      @default(now())
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  coursesAuthored Course[]     @relation("CourseAuthor")
+  enrollments    Enrollment[]
+  quizAttempts   QuizAttempt[]
+  assignmentSubmissions AssignmentSubmission[]
+  auditLogs      AuditLog[]
+}
+
+model Course {
+  id             String            @id
+  organizationId String
+  authorId       String
+  title          String
+  summary        String
+  status         CourseDraftStatus @default(DRAFT)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  organization   Organization      @relation(fields: [organizationId], references: [id])
+  author         User              @relation("CourseAuthor", fields: [authorId], references: [id])
+  modules        CourseModule[]
+  versions       CourseVersion[]
+  quizzes        Quiz[]
+  assignments    Assignment[]
+}
+
+model CourseModule {
+  id        String   @id
+  courseId  String
+  title     String
+  position  Int
+  course    Course   @relation(fields: [courseId], references: [id])
+  lessons   Lesson[]
+}
+
+model Lesson {
+  id        String  @id
+  moduleId  String
+  title     String
+  content   String
+  position  Int
+  module    CourseModule @relation(fields: [moduleId], references: [id])
+  progress  LessonProgress[]
+}
+
+model CourseVersion {
+  id          String   @id
+  courseId    String
+  version     Int
+  title       String
+  summary     String
+  contentSnapshot Json
+  publishedAt DateTime @default(now())
+  course      Course   @relation(fields: [courseId], references: [id])
+  enrollments Enrollment[]
+}
+
+model Enrollment {
+  id              String           @id
+  learnerId       String
+  courseVersionId String
+  status          EnrollmentStatus @default(ACTIVE)
+  enrolledAt      DateTime         @default(now())
+  completedAt     DateTime?
+  learner         User             @relation(fields: [learnerId], references: [id])
+  courseVersion   CourseVersion    @relation(fields: [courseVersionId], references: [id])
+  lessonProgress  LessonProgress[]
+  quizAttempts    QuizAttempt[]
+  assignmentSubmissions AssignmentSubmission[]
+  certificates    Certificate[]
+}
+
+model LessonProgress {
+  id           String               @id
+  enrollmentId String
+  lessonId     String
+  status       LessonProgressStatus @default(NOT_STARTED)
+  completedAt  DateTime?
+  enrollment   Enrollment           @relation(fields: [enrollmentId], references: [id])
+  lesson       Lesson                @relation(fields: [lessonId], references: [id])
+}
+
+model Quiz {
+  id           String @id
+  courseId     String
+  title        String
+  passingScore Int
+  course       Course @relation(fields: [courseId], references: [id])
+  questions    QuizQuestion[]
+  attempts     QuizAttempt[]
+}
+
+model QuizQuestion {
+  id            String @id
+  quizId        String
+  prompt        String
+  correctAnswer String
+  points        Int
+  quiz          Quiz   @relation(fields: [quizId], references: [id])
+}
+
+model QuizAttempt {
+  id        String            @id
+  enrollmentId String
+  quizId    String
+  learnerId String
+  status    QuizAttemptStatus @default(IN_PROGRESS)
+  score     Int?
+  passed    Boolean?
+  answers   Json
+  createdAt DateTime          @default(now())
+  enrollment Enrollment        @relation(fields: [enrollmentId], references: [id])
+  quiz      Quiz              @relation(fields: [quizId], references: [id])
+  learner   User              @relation(fields: [learnerId], references: [id])
+}
+
+model Assignment {
+  id          String @id
+  courseId    String
+  title       String
+  instructions String
+  course      Course @relation(fields: [courseId], references: [id])
+  submissions AssignmentSubmission[]
+}
+
+model AssignmentSubmission {
+  id           String                     @id
+  enrollmentId String
+  assignmentId String
+  learnerId    String
+  content      String
+  status       AssignmentSubmissionStatus @default(SUBMITTED)
+  grade        Int?
+  feedback     String?
+  submittedAt  DateTime                   @default(now())
+  enrollment   Enrollment                 @relation(fields: [enrollmentId], references: [id])
+  assignment   Assignment                 @relation(fields: [assignmentId], references: [id])
+  learner      User                       @relation(fields: [learnerId], references: [id])
+}
+
+model Certificate {
+  id             String            @id
+  enrollmentId   String
+  status         CertificateStatus @default(PENDING)
+  verificationId String            @unique
+  artifactUrl    String?
+  issuedAt       DateTime?
+  enrollment     Enrollment        @relation(fields: [enrollmentId], references: [id])
+}
+
+model AuditLog {
+  id             String        @id
+  organizationId String?
+  actorId        String?
+  action         String
+  targetType     String
+  targetId       String
+  metadata       Json
+  createdAt      DateTime      @default(now())
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  actor          User?         @relation(fields: [actorId], references: [id])
+}
