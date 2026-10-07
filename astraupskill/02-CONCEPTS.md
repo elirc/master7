@@ -1,65 +1,63 @@
 # 02. Understand the scope rule
 
-An Actor has a role and organizationId. The existing audit-log policy treats
-organization staff as organization-scoped, PLATFORM_ADMIN as cross-tenant,
-and LEARNER as forbidden or empty depending on the projection. The dashboard
-contract deliberately returns auditLogs: [] for learners, so the repair keeps
-that response shape. A staff actor's visible set is
-store.auditLogs.filter(log => log.organizationId === actor.organizationId).
-Only after this filter should slice(0, 25) be applied.
+## Authentication is not authorization
 
-Ordering matters. Suppose the store begins with twenty-five Nova records and
-then one Acme record. Filtering after slice returns no Acme event, while
-filtering before slice returns the Acme event. The latter is the correct
-tenant projection and prevents record order from acting as an access rule.
-Platform administrators intentionally receive the global first page because
-their role is the documented cross-organization exception.
+`requireAuth` answers "who is calling?". It says nothing about which rows that
+caller may read. Every projection must still apply an organization rule, and
+the dashboard is a projection like any other. Having one correctly scoped
+endpoint (`/audit-logs`) did not protect a second reader of the same array.
 
-The rule concerns dashboard audit records. It does not claim that every other
-dashboard collection is redesigned, that the in-memory store is a database,
-or that JWT issuance becomes production authentication. Synthetic records
-contain Acme and Nova organization IDs and no secrets. A useful review checks
-both output and actor class: Acme staff cannot see Nova targets, platform
-admins can see both, and learners have no audit entries. Keep those assertions
-beside existing dashboard behavior so a future change cannot silently make
-the dashboard and audit-log endpoint disagree again.
+## The rule, per role
 
-The projection also preserves paging semantics within the chosen scope. The
-API exposes only a first page through slice(0, 25), so this fix adds no cursor
-or page parameter. It makes page one the first twenty-five records the actor
-may read. If a later feature adds paging, the organization predicate should
-remain in the repository query or in-memory selection before offset and limit.
-Keeping policy and paging in that order prevents a foreign tenant from
-consuming the page budget.
+| Role | Dashboard `auditLogs` | `GET /audit-logs` |
+| --- | --- | --- |
+| `LEARNER` | `[]` (200) | 403 |
+| `INSTRUCTOR`, `ORG_ADMIN` | rows where `log.organizationId === actor.organizationId` | same rows, plus filters and paging |
+| `PLATFORM_ADMIN` | every row (the documented cross-tenant exception) | every row |
+
+The learner difference is deliberate and stays in each reader: the dashboard
+contract returns an empty list, the dedicated endpoint refuses outright.
+
+## Filter before limit
+
+Suppose the store holds 26 Nova rows followed by 1 Acme row (newest first).
+
+- `slice(0, 25)` then filter: the slice contains only Nova rows, so the Acme
+  admin gets **zero** rows - and, with no filter at all, 25 Nova rows.
+- filter then `slice(0, 25)`: the Acme admin gets their **one** row.
+
+The second order is the only correct one: otherwise row order, which another
+tenant controls just by being busy, becomes an access rule. 05 Exercise 2
+measures both orders against the real current code and the original snapshot.
 
 ## One predicate, two readers
 
-The first version of this fix wrote the scope rule twice: once inside the dashboard helper and once inside
-`services.auditLogs`. Two copies of `role === "PLATFORM_ADMIN" || log.organizationId === actor.organizationId`
-is exactly how the two endpoints disagreed in the first place, so the rule is now a single exported function:
+The first version of the fix wrote the comparison twice. Two copies of
+`role === "PLATFORM_ADMIN" || log.organizationId === actor.organizationId` is
+exactly how the two endpoints came to disagree, so the current code exports a
+single `auditLogScope(actor)` (`services.ts:28-30`) and both
+`visibleAuditLogs` (line 34) and `services.auditLogs` (line 137) call it.
+`apps/api/src/audit-scope.test.ts:31-42` then asserts the two endpoints return
+the same row ids for the same actor. General habit: when two endpoints project
+the same table, the ownership rule is one named function, and a test pins the
+readers together.
 
-~~~ts
-export function auditLogScope(actor: Actor) {
-  return (log: { organizationId: string | null }) =>
-    actor.role === "PLATFORM_ADMIN" || log.organizationId === actor.organizationId;
-}
-~~~
+## The write side of the same rule
 
-`visibleAuditLogs` (the dashboard projection) and `services.auditLogs` (the dedicated endpoint) both call it,
-and `apps/api/src/audit-scope.test.ts` asserts the two endpoints return the same row ids for the same actor.
-Read that as the general habit: when two endpoints project the same table, the ownership rule is one named
-function that both call, and a test pins them together. The learner rule stays in each endpoint because it
-genuinely differs - the dashboard returns `[]`, the dedicated endpoint returns 403.
+Visibility is decided by the `organizationId` stamped at write time. A reader
+predicate can be perfect and still hide or leak a row if the writer stamped
+the wrong tenant. The worked change does not touch writers; 06 shows one that
+stamps `actor.organizationId` (null for a platform admin) instead of the
+enrollment's organization.
 
 ## If this store were a database
 
-Nothing here touches PostgreSQL, so translate before you carry the lesson into a Prisma or EF Core codebase:
-
-| In-memory here | Prisma equivalent | EF Core equivalent |
+| In-memory here | Prisma | EF Core |
 | --- | --- | --- |
-| `store.auditLogs.filter(auditLogScope(actor))` | `prisma.auditLog.findMany({ where: auditLogScope(actor) })` where the scope returns `{}` for a platform admin and `{ organizationId: actor.organizationId }` otherwise | `db.AuditLogs.Where(AuditLogScope(actor))` |
-| `.slice(0, 25)` after the filter | `take: 25` in the *same* query as `where` | `.Take(25)` after `.Where(...)` |
-| Filter-after-slice bug | `findMany({ take: 25 })` then filtering the array in JavaScript | `.Take(25).ToList().Where(...)` |
+| `store.auditLogs.filter(auditLogScope(actor))` | `findMany({ where: scopeWhere(actor) })`, where `scopeWhere` returns `{}` for a platform admin and `{ organizationId }` otherwise | `.Where(scope)` |
+| `.slice(0, 25)` after the filter | `take: 25` in the *same* query | `.Take(25)` after `.Where(...)` |
+| the original bug | `findMany({ take: 25 })`, then filter the array in JavaScript | `.Take(25).ToList().Where(...)` |
 
-The database versions make the ordering mistake harder, because `where` and `take` belong to one query object -
-but only if you resist fetching first and filtering in application code. That is the same bug in a new costume.
+The Prisma schema's `AuditLog.organizationId` is nullable
+(`packages/database/prisma/schema.prisma:224`), just like the in-memory type,
+so the "null organization" case in 06 would survive a move to the database.

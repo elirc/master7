@@ -1,85 +1,90 @@
-# 04. Build the local regression fixture
+# 04. Test the projection over real HTTP
 
-The meaningful test uses the real Express app and seeded in-memory store. It
-logs in the Acme administrator using the repository's documented
-password, obtains the returned token, and calls the dashboard endpoint with
-that authorization. The response is then checked for the Acme seeded target
-and the absence of the Nova seeded target. This is stronger than calling a
-new helper in isolation because it exercises login, JWT middleware, route
-dispatch, actor construction, services.dashboard, and JSON serialization.
+## What the suite contains
 
-The second actor is the seeded platform administrator. Their dashboard must
-contain both Acme and Nova target IDs, demonstrating the deliberate global
-exception. The third actor is the seeded learner. Their dashboard auditLogs
-must be an empty array, matching the pre-existing product contract. Existing
-dashboard fields remain present, so the regression should also check a normal
-course or organization field to detect accidental projection replacement in
-an extended exercise. The added audit regression itself checks the audit
-field; the suite's other dashboard tests cover existing organization behavior.
+`npm test` runs `vitest run` at the root. With no `vitest.config` file, Vitest
+picks up every `*.test.ts`: **23 tests in 4 files**.
 
-The store records are synthetic and local. The test does not contact a real
-database, identity provider, notification service, or external API. It proves
-the service's in-memory response selection. A stronger follow-up can seed more
-than twenty-five foreign records before one local event to assert that
-filter-before-limit is preserved; the current two-organization case catches
-the original global leak and is sufficient for this bounded slice.
+| File | Tests | Level |
+| --- | --- | --- |
+| `apps/api/src/api.test.ts` | 11 | real Express app over HTTP |
+| `apps/api/src/audit-scope.test.ts` | 4 | real Express app over HTTP, plus direct store reads |
+| `apps/api/src/policies.test.ts` | 4 | pure policy functions |
+| `packages/domain/src/domain.test.ts` | 4 | pure domain functions |
 
-Use explicit target IDs instead of checking only a count. A count of one could
-pass if the wrong tenant's single record were returned. Checking inclusion and
-exclusion documents the boundary. The platform assertion should check both
-seeded IDs, and the learner assertion should check deep equality with an empty
-array. If the API returns an error, preserve response body and status in the
-raw test log so a reviewer can distinguish authentication failure from
-projection failure. Keep fixtures deterministic and avoid random expected IDs.
-Read [the actual API tests](../apps/api/src/api.test.ts) alongside the raw run
-record. The new staff assertion combines a nonempty list, an organization
-predicate for every returned record, and exclusion of `version-forklift-v1`.
-That nonempty check matters because `[].every(...)` is true: an implementation
-that accidentally hid all records would otherwise pass the ownership check.
+Both API files use the same `request()` helper: `createApp()`,
+`app.listen(0)` on an ephemeral port, `fetch`, then `server.close()`. A
+request therefore exercises login, JWT verification, route dispatch, actor
+construction, the service, error mapping and JSON serialization - stronger
+than calling `visibleAuditLogs` directly. Running it needs `npm ci` first
+(there is no `node_modules` in a fresh clone). The 05 checks need no install.
 
+## The dashboard regression (`api.test.ts:35-58`)
 
-## Running the fixture
+Three actors, three assertion styles:
 
-The suite is Vitest at the repository root; `verify` is the ordered gate the repository uses, and it stops at the first failure rather than reporting a build over a red test. From the root `package.json`, `scripts`:
+- **Acme admin**: `auditLogs.length > 0`, *every* row has
+  `organizationId === "org-acme"`, and `version-forklift-v1` is absent. The
+  non-empty check matters because `[].every(...)` is `true` - an
+  implementation that hid all rows would otherwise pass.
+- **Platform admin**: target ids contain both `version-security-v1` and
+  `version-forklift-v1`.
+- **Learner**: `auditLogs` deep-equals `[]`, with status 200.
 
-```bash
-npm test     # vitest run
-npm run verify   # db:validate && typecheck && test && build
-```
+Explicit target ids beat counts: a count of one passes if the wrong tenant's
+single row comes back.
 
-## Break it first (do this before reading 05)
+## The four tests in `audit-scope.test.ts`
 
-You learn more from a red test than from a green one. This project ships the exact pre-change source in
-`astraupskill/snapshots/`, so you can reintroduce the bug and measure it.
+1. **Agreement** (lines 31-42): for the Acme admin and the platform admin, the
+   dashboard and `GET /audit-logs?page=1&pageSize=25` return the same row ids.
+2. **Filter before limit** (44-61): empty the log, `seedAuditLogs(1,
+   "org-acme")`, then `seedAuditLogs(26, "org-nova")`. Acme admin sees exactly
+   1 row; platform admin sees exactly 25.
+3. **Write path** (63-85): an Acme instructor `POST /courses`; the
+   `course.created` row carries `org-acme`, is visible to the Acme admin via
+   `/audit-logs`, and is excluded by `auditLogScope` for a synthetic Nova
+   admin.
+4. **Cross-tenant write refused** (87-96): the same instructor names
+   `org-nova` in the body; 403 and no `course.created` row for Nova.
 
-1. Note the current state: `npm test` -> `Test Files 4 passed (4) / Tests 22 passed (22)`.
-2. Open `apps/api/src/services.ts` and replace the body of `visibleAuditLogs` with the original expression
-   from `snapshots/services-before.ts.txt`:
-   `auditLogs: actor.role === "LEARNER" ? [] : store.auditLogs.slice(0, 25)` (it lives inline in `dashboard`
-   in the snapshot; putting the unscoped `slice` back in the helper is equivalent for this exercise).
-3. Run only the affected files: `npx vitest run apps/api/src/api.test.ts apps/api/src/audit-scope.test.ts`.
-4. Record which tests turn red and the exact assertion message. Expect
-   `scopes dashboard audit logs by organization while platform admins see both tenants` to fail on
-   `expect(adminResult.auditLogs.every(...)).toBe(true)`, and the filter-before-limit test in
-   `audit-scope.test.ts` to fail with `expected length 1, received 25` or similar.
-5. Restore the fix (`git checkout -- apps/api/src/services.ts`, or paste the scoped version back) and rerun
-   until you are green again.
+`afterEach(resetStore)` (line 26) restores the shared singleton so no fixture
+leaks into the next test. Note that `api.test.ts` has **no** such hook; its
+tests only stay independent because none of them depends on the exact
+contents of arrays the others append to.
 
-Then do the same with the *shared predicate*: change only `services.auditLogs` to use its own copy of the
-comparison, with `log.organizationId === actor.organizationId` and no `PLATFORM_ADMIN` branch. The dashboard
-test stays green and `returns the same audit rows on the dashboard and on /audit-logs for the same actor`
-turns red. That is the test whose whole job is to stop the two projections drifting apart again.
+## Break it first
 
-## The three tests added in `audit-scope.test.ts`
+After `npm ci`, confirm `Test Files 4 passed (4)` / `Tests 23 passed (23)`.
 
-- **Agreement**: for an org admin and for a platform admin, `GET /me/dashboard` and `GET /audit-logs?pageSize=25`
-  return the same row ids. This is the test the concepts chapter argues for.
-- **Filter before limit**: `resetStore()`, empty `store.auditLogs`, then `seedAuditLogs(1, "org-acme")` and
-  `seedAuditLogs(26, "org-nova")`. The Acme admin must still see their single row; the platform admin sees 25
-  (the limit). Without the helpers this fixture had to be hand-written in the test.
-- **Write path**: an Acme instructor `POST /courses`, and the emitted `course.created` audit row must carry the
-  *actor's* `organizationId`. The same row is then visible to the Acme admin and excluded by
-  `auditLogScope` for a Nova admin. Who writes an audit row and who may read it are the two halves of one rule.
+1. In `apps/api/src/services.ts`, change `visibleAuditLogs` to
+   `return store.auditLogs.slice(0, 25);` after the learner early return
+   (equivalent to the snapshot's inline expression).
+2. Run `npx vitest run apps/api/src/api.test.ts apps/api/src/audit-scope.test.ts`.
+3. Expect exactly **three** red tests:
+   - `api.test.ts` dashboard regression, on the `every(... === "org-acme")`
+     assertion (the Nova row is now in the Acme list);
+   - audit-scope **agreement**, because the dashboard is now global while
+     `/audit-logs` is still scoped;
+   - audit-scope **filter-before-limit**, on `toHaveLength(1)` - it received
+     25 Nova rows.
+   The learner assertion, the write-path test and the refusal test stay green.
+4. Restore with `git checkout -- apps/api/src/services.ts`.
 
-Every test calls `resetStore()` in `afterEach`, so the shared in-memory singleton cannot leak a fixture into
-the next test.
+Second drill: make only `services.auditLogs` use its own
+`log.organizationId === actor.organizationId` (no platform branch). Now only
+the agreement test fails - a platform admin's endpoint list becomes empty
+because no seeded row has `organizationId: null`. That is the test whose job
+is to stop the two readers drifting apart.
+
+## Debugging tips
+
+- A 401 from a test usually means login failed, not that scope is wrong; log
+  `response.status` and body before asserting on the dashboard.
+- Thrown service errors are classified by **message text**
+  (`errors.ts:28-34`): "not found" -> 404; "forbidden", "does not belong",
+  "cannot" or "only the" -> 403; anything else -> 500. If a status surprises
+  you, read the error message first. 06 shows where this misfires.
+- If a test flakes on a slow machine with a timeout on the first request,
+  that is the TypeScript transform warming up; the recorded run used
+  `--testTimeout=30000` (see VERIFICATION).

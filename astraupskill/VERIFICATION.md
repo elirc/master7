@@ -1,47 +1,47 @@
 # Verification: tenant-scoped dashboard audit logs
 
-> **Update (follow-up pass).** The course now ships four extra tests in `apps/api/src/audit-scope.test.ts`, and the
-> suite passes **23 tests in four files**. The raw log for that run is [evidence/tests-root-02.log](evidence/tests-root-02.log)
-> (`Test Files 4 passed (4)` / `Tests 23 passed (23)`), and `npm run typecheck` was clean in the same pass.
-> Everything below describes the original 19-test delivery run, whose log is still in `evidence/tests-root-01.log`;
-> both numbers are real and neither replaces the other.
+There were two passes over this change. Keep their evidence separate.
 
-The reviewed change passed **19 tests in three files**, TypeScript checking, and the complete workspace build. The tests comprise eleven API tests, four policy tests and four domain tests. The newly added dashboard regression uses the actual local Express application and HTTP requests with synthetic seeded identities. This is stronger evidence than testing the new filter helper alone: removing the dashboard's call to the helper makes the organization isolation assertion fail against the two-organization fixture.
+## Pass 1 - the original delivery (2026-09-12)
 
-## Reproduce from the project root
+The original repair inlined the scope rule in a dashboard helper and added the
+dashboard regression to `api.test.ts`. At that point the suite had **19 tests
+in three files** (11 API, 4 policy, 4 domain), and `npm test`, `npm run
+typecheck` and `npm run build` all exited 0.
 
-Use Node 22.16 and npm 10.9.2, the versions used for this run, or verify compatibility separately when changing runtimes. The root lockfile and normal install were used; lifecycle scripts were enabled. The following commands use the package scripts already present in the project. They do not require a running PostgreSQL server.
+What `evidence/` actually holds for that pass is **process records only**:
+`install-01.json`, `tests-root-01.json`, `typecheck-root-01.json` and
+`build-root-01.json` each record the command, start/finish time, exit code 0
+and `passed: true`. Their `log` fields name `.log` files that were **not
+committed**, so the test *count* is not recorded in the repository; the JSON
+proves only that the commands succeeded. The `cwd` and npm-cache paths inside
+them point at the authoring machine's staging folder - treat these files as
+frozen historical records, not as paths to reproduce.
 
-```powershell
-npm ci --no-audit --no-fund
-if ($LASTEXITCODE -ne 0) { throw 'Installation failed' }
-npm test -- --pool=threads --poolOptions.threads.singleThread=true --testTimeout=30000
-if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
-npm run typecheck
-if ($LASTEXITCODE -ne 0) { throw 'Type checking failed' }
-npm run build
-if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-```
+`root-final-source-hashes.json` lists SHA-256 hashes for 43 source files at
+the end of pass 1. Checked on 2026-10-06 against the current tree: 41 still
+match; `apps/api/src/services.ts` and `apps/api/src/store.ts` differ, and
+`apps/api/src/audit-scope.test.ts` is absent from the list - all three were
+changed or added by pass 2.
 
-The test options match this project's Vitest 2 runner. Do not copy version-specific runner flags into unrelated projects without checking their installed version. The application build runs the workspace scripts for the API, web application and shared packages. This project uses Vite for its web build; invoking a Next.js executable here is not a valid verification command.
+## Pass 2 - the follow-up
 
-## What was observed
+Pass 2 made three changes:
 
-The [test output](evidence/tests-root-01.log) records nineteen passing tests, and the [test process record](evidence/tests-root-01.json) records exit code zero and the command's working directory. [Typecheck output](evidence/typecheck-root-01.log) and its [process record](evidence/typecheck-root-01.json), plus [build output](evidence/build-root-01.log) and its [process record](evidence/build-root-01.json), retain the other successful checks. [Installation evidence](evidence/install-01.json) records the earlier successful normal dependency install. [Source hashes](evidence/root-final-source-hashes.json) were compared after the checks; the reviewed executable files stayed unchanged while these commands ran.
+1. Exported `auditLogScope(actor)` from `services.ts` and made both
+   `visibleAuditLogs` and `services.auditLogs` call it.
+2. Added `resetStore()` and `seedAuditLogs(...)` to `store.ts`.
+3. Added `apps/api/src/audit-scope.test.ts` (4 tests: agreement,
+   filter-before-limit, write-path organization, cross-tenant write refused).
 
-The dashboard regression signs in synthetic Acme staff, a platform administrator and a learner. The staff response must contain only Acme audit records, the platform response must include both seeded organizations, and the learner response must contain an empty audit list. The existing audit endpoint retains its own learner restriction and organization filtering. Filtering occurs before taking the first 25 records, so another organization's entries cannot consume the current organization's dashboard limit.
+Counting `it(` calls in the current tree gives **23 tests in 4 files**
+(11 + 4 + 4 + 4). No evidence file for a pass-2 run is committed, so
+reproduce it yourself (below) rather than relying on a recorded number.
 
-## Limits and the next useful test
+## Reproduce
 
-The runtime uses the existing in-memory `store`. The Prisma schema elsewhere in the repository does not make these HTTP tests persistent-database integration tests. They establish response selection for the tested actors and fixtures, not row-level database security or behavior after a server restart. This patch does not redesign authentication, course-version submission validation, or the broader enrollment workflow. Synthetic demo credentials are teaching fixtures, not deployment credentials.
-
-The focused source review confirmed that the policy is called by the dashboard service. A useful next exercise is to add more than 25 interleaved audit records for two organizations, then assert both the result limit and organization ownership. Another is to test every operational role explicitly using the same organization policy. These are proposed exercises; they are not included in the recorded nineteen-test count. Keep browser accessibility, a persistent adapter, concurrent writes and production deployment as separate verification scopes. A passing build is not evidence that those paths have been exercised.
-
-An earlier ad hoc attempt invoked a missing Next executable and failed. Its raw output remains in the central history; the successful build recorded here uses the actual root `npm run build` script. Reading the exact command and exit status prevents a setup error from being mistaken for an application defect or silently counted as a pass.
-
-## Reproducing on macOS or Linux
-
-The PowerShell block above is Windows-specific only in its error handling. The same run on macOS or Linux:
+Use Node 22.16 and npm 10.9 (the versions of the recorded runs). No database,
+Docker or Postgres is involved; the API runs on the in-memory store.
 
 ```bash
 npm ci --no-audit --no-fund
@@ -50,28 +50,26 @@ npm run typecheck
 npm run build
 ```
 
-`set -e` at the top of a script gives you the `if ($LASTEXITCODE -ne 0) { throw }` behaviour. The
-`--testTimeout=30000` flag is not cosmetic on a slow machine: with the default 5 s timeout the first test can
-fail purely because the TypeScript transform of the workspace has not finished warming up. That is a runner
-timeout, not an application defect - read the failure message before you go looking for a bug.
+Expect `Test Files 4 passed (4)` and `Tests 23 passed (23)`. The 30 s timeout
+is not cosmetic: on a slow machine the first request can exceed Vitest's 5 s
+default while the TypeScript transform warms up - a runner timeout, not an
+application defect. `npm run verify` runs `db:validate`, `typecheck`, `test`
+and `build` in order and stops at the first failure.
 
-Node 22.16 and npm 10.9.2 were used for both recorded runs. There is no database, so no Postgres port, Docker
-image or migration is involved anywhere in this course.
+Without installing anything, the six 05 checks run the real services against
+the real store and the original snapshot:
+`node --experimental-transform-types --test <scratch>/ex*.test.mjs` from the
+repo root. On 2026-10-06 they reported `# tests 9`, `# pass 9`, `# fail 0` on
+Node 22.16.0.
 
-## What the follow-up run added
+## Limits
 
-The follow-up pass made three changes and re-verified them:
-
-1. `auditLogScope(actor)` is exported from `apps/api/src/services.ts` and is now the single implementation of
-   the scope rule used by both the dashboard projection and `services.auditLogs`.
-2. `resetStore()` and `seedAuditLogs(count, organizationId, options?)` are exported from
-   `apps/api/src/store.ts` so the practice fixtures are buildable without hand-editing the store.
-3. `apps/api/src/audit-scope.test.ts` adds four tests: dashboard/endpoint agreement, filter-before-limit with a
-   26-Nova/1-Acme fixture, the actor's organization on a `course.created` audit row, and a 403 with no audit row
-   when an instructor names another organization in the request body.
-
-The root `README.md` entry that pointed at `docs/code-walkthroughs/audit-log-scope/README.md` was wrong - that
-directory has never existed - and now points at `astraupskill/README.md`.
-
-Limits are unchanged: this is still an in-memory store, still no Prisma client at runtime, and still no
-browser or deployment evidence.
+- The runtime store is in memory. The Prisma schema and
+  `packages/database` are not used by the API, so none of this is evidence of
+  database row-level security or of behavior after a restart.
+- The HTTP tests cover the seeded admin, platform admin and learner; the
+  instructor case is covered only by 05 Exercise 1.
+- Nothing here exercises the browser, a deployment, or concurrent writers.
+- The open findings in 06 (audit writer tenant, regex error mapping, id
+  oracle, non-idempotent certificates, plaintext passwords/default JWT
+  secret, duplicate enrollments) are unaffected by this change.

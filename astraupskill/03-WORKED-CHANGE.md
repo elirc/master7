@@ -1,49 +1,10 @@
 # 03. Read the before and after
 
-The original dashboard branch in apps/api/src/services.ts was, as preserved
-in the [exact original snapshot](snapshots/services-before.ts.txt):
+Diff [snapshots/services-before.ts.txt](snapshots/services-before.ts.txt)
+against `apps/api/src/services.ts`. Ignoring line endings, there are exactly
+three hunks.
 
-~~~ts
-auditLogs: actor.role === "LEARNER" ? [] : store.auditLogs.slice(0, 25)
-~~~
-
-The source change introduces a single projection helper:
-
-~~~ts
-function visibleAuditLogs(actor: Actor) {
-  if (actor.role === "LEARNER") return [];
-  if (actor.role === "PLATFORM_ADMIN") return store.auditLogs.slice(0, 25);
-  return store.auditLogs
-    .filter((log) => log.organizationId === actor.organizationId)
-    .slice(0, 25);
-}
-~~~
-
-dashboard now assigns auditLogs: visibleAuditLogs(actor). The helper is
-intentionally close to the existing audit-log service rule and keeps the
-learner and platform branches explicit. The filter precedes the page limit,
-so a tenant's records are not displaced by another tenant's first page.
-
-The store adds synthetic Acme and Nova events with stable IDs and organization
-IDs. The API regression logs in seeded users, requests dashboard data, and
-asserts visible target IDs. It therefore catches the old global slice while
-also preserving platform and learner behavior. The feature document records
-the behavior and its teaching limits. No package manifest, lockfile, JWT
-format, or web route changes are required for this slice.
-
-The helper returns new arrays for staff and platform branches, while the
-learner branch creates a fresh empty literal. It does not reorder or remove
-store.auditLogs, which matters to the following request and to fixture
-comparisons. The algorithm remains correct when foreign records outnumber
-local records because the predicate executes before the page limit. A
-reviewer can compare the original snapshot with this replacement and identify
-the behavioral delta without inferring an unrelated redesign.
-
-This keeps the audit projection deterministic for every ordinary staff actor.
-
-## The shipped predicate
-
-The replacement is two small functions: one exported predicate that both readers share, and the dashboard branch that still returns nothing for a learner. From `apps/api/src/services.ts:28-35`:
+**1. A shared predicate and a dashboard helper are added (current lines 28-35):**
 
 ```ts
 export function auditLogScope(actor: Actor) {
@@ -56,31 +17,55 @@ function visibleAuditLogs(actor: Actor) {
 }
 ```
 
-## Follow-up change: extracting the shared predicate
+**2. The dashboard field uses the helper (current line 70):**
 
-After the first repair the scope expression existed in two places. The current source extracts it once:
+```diff
+-      auditLogs: actor.role === "LEARNER" ? [] : store.auditLogs.slice(0, 25)
++      auditLogs: visibleAuditLogs(actor)
+```
 
-~~~ts
-// apps/api/src/services.ts
-export function auditLogScope(actor: Actor) {
-  return (log: { organizationId: string | null }) =>
-    actor.role === "PLATFORM_ADMIN" || log.organizationId === actor.organizationId;
-}
+**3. The dedicated endpoint drops its private copy of the rule (current line 137):**
 
-function visibleAuditLogs(actor: Actor) {
-  if (actor.role === "LEARNER") return [];
-  return store.auditLogs.filter(auditLogScope(actor)).slice(0, 25);
-}
-~~~
+```diff
+-      .filter((log) => actor.role === "PLATFORM_ADMIN" || log.organizationId === actor.organizationId)
++      .filter(auditLogScope(actor))
+```
 
-and `services.auditLogs` now reads `.filter(auditLogScope(actor))` in place of its own copy of the same
-comparison. Behavior is identical - the point is that a future edit cannot change one reader without the
-other. `apps/api/src/audit-scope.test.ts` holds the test that enforces it.
+Hunk 3 changes no behavior; it removes the second copy of the rule so a future
+edit cannot change one reader without the other.
 
-Two teaching helpers were added to `apps/api/src/store.ts` at the same time, because the practice chapter
-asks you to build a bigger fixture and the old advice was "edit `store.ts` by hand":
+## Why it is shaped this way
 
-~~~ts
-export function resetStore(): void;                       // restore the seeded demo fixture
-export function seedAuditLogs(count: number, organizationId: string, options?): void;
-~~~
+- The learner branch stays an explicit early return because the dashboard
+  contract (`[]`) differs from the endpoint's (403).
+- The platform exception lives inside the predicate, so both readers treat a
+  platform admin identically.
+- `filter` runs before `slice`, so a busy tenant cannot push another tenant's
+  rows off the first page.
+- `filter` and `slice` both return new arrays; `store.auditLogs` is never
+  reordered or mutated by a read.
+
+## Test-support changes in the store
+
+Diffing `snapshots/store-before.ts.txt` against `apps/api/src/store.ts` shows
+two additions:
+
+- The seed's `auditLogs` was `[]`. It now holds `audit-seeded-acme` and
+  `audit-seeded-nova` (`store.ts:155-158`). Without a row from each tenant,
+  the leak could not be observed at all - an empty fixture passes every
+  ownership assertion.
+- Two exported helpers (lines 161-177): `resetStore()` restores a deep copy
+  of the fixture captured at module load, and `seedAuditLogs(count,
+  organizationId, options?)` `unshift`s synthetic rows with ids like
+  `audit-org-nova-1`.
+
+`snapshots/api-tests-before.ts.txt` differs from `api.test.ts` by one added
+test (the dashboard scope regression, `api.test.ts:35-58`), and
+`snapshots/audit-feature-before.md.txt` is the earlier text of
+`docs/features/07-audit-log-viewer.md`.
+
+## What was deliberately not changed
+
+No package manifest, lockfile, JWT format, web route, or audit *writer* was
+touched. The writers that stamp `actor.organizationId` (01, "Who writes audit
+rows") are a separate problem with their own test, covered in 06.

@@ -1,68 +1,280 @@
-# 05. Predict the dashboard output
+# 05. Practice: predict, then check
 
-Use the seeded events audit-seeded-acme and audit-seeded-nova. The first has
-organizationId org-acme and the second has organizationId org-nova. Predict
-the results before running the test.
+Every exercise has a **Goal**, a prediction to write down first, and a
+**Check** you run. The checks import the real TypeScript sources with Node's
+built-in type stripping, so they need **no `npm install`** - only Node 22.16
+or newer (they were verified on 22.16.0).
 
-Exercise 1: an Acme instructor requests the dashboard. Which target IDs may
-appear in auditLogs? Exercise 2: a platform administrator requests it. Why
-does their list contain both organizations? Exercise 3: a learner requests
-it. What is the exact JSON shape of auditLogs? Exercise 4: put twenty-six
-Nova events before one Acme event and run the staff projection. Does the Acme
-event appear on page one? Explain the order of filter and slice. Exercise 5:
-compare dashboard auditLogs with the dedicated audit-log endpoint. What
-shared scope decision should a reviewer expect?
+## Setup (once)
 
-The answers follow actor role and organization, not event actor or target
-course. An Acme staff member cannot see Nova merely because the event's actor
-is a platform user, and a Nova event cannot be made local by changing its
-target label. A platform admin is the explicit cross-tenant exception. The
-learner result is an empty array rather than an authorization error because
-that is the dashboard contract already used by the code.
+Make a scratch folder **outside** the repo (for example `../m7-practice/`)
+and save this loader there as `lms-loader.mjs`. It teaches Node three things
+the workspace normally gets from `npm install` and `tsc`: where `@lms/domain`
+lives, that `./store.js` means `./store.ts`, and how to load the `.ts.txt`
+snapshots as TypeScript.
 
-When inspecting the fixture after a request, do not expect records to be
-deleted. dashboard reads and filters arrays. If you add the twenty-six-event
-case, restore the fixture for the next actor or create a fresh store so the
-test remains deterministic. This exercise tests the projection's boundary
-and ordering without implying a full database authorization model.
-
-As a debugging technique, inspect actor.role, actor.organizationId, and
-candidate organization IDs at the helper boundary without printing tokens or
-passwords. For Exercise 4, the useful observation is that the Acme event
-survives because candidates were reduced to Acme before slice runs. If a trace
-shows slice first, compare the implementation with the original snapshot.
-Remove temporary logging after confirmation and rely on explicit IDs in the
-regression. The lesson is complete when one policy explains all five answers
-and the store remains unchanged.
-
-## Exercise 4, restated now that the helpers exist
-
-`apps/api/src/store.ts` exports `resetStore()` and `seedAuditLogs(count, organizationId, options?)`, so you no
-longer edit the fixture by hand. Build the case like this and predict the two results before running it:
-
-```ts
-resetStore();
-store.auditLogs.length = 0;
-seedAuditLogs(1, "org-acme");
-seedAuditLogs(26, "org-nova");
+```js
+// lms-loader.mjs - dependency-free loader so `node --test` can import this workspace's TypeScript.
+import { register } from 'node:module';
+import { pathToFileURL } from 'node:url';
+const root = pathToFileURL(process.cwd() + '/').href;
+const hooks = `
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const root = ${JSON.stringify(root)};
+export async function resolve(specifier, context, next) {
+  if (specifier === '@lms/domain') return { url: root + 'packages/domain/src/index.ts', shortCircuit: true };
+  if (specifier.startsWith('.') && context.parentURL) {
+    const base = context.parentURL.endsWith('.ts.txt') ? root + 'apps/api/src/x' : context.parentURL;
+    const ts = new URL(specifier.replace(/\\.js$/, '.ts'), base);
+    if (existsSync(fileURLToPath(ts))) return { url: ts.href, shortCircuit: true };
+  }
+  return next(specifier, context);
+}
+export async function load(url, context, next) {
+  if (url.endsWith('.ts.txt')) return { format: 'module-typescript', source: readFileSync(fileURLToPath(url), 'utf8'), shortCircuit: true };
+  return next(url, context);
+}`;
+register('data:text/javascript,' + encodeURIComponent(hooks));
 ```
 
-Predict: how many rows does `GET /me/dashboard` return for `admin@acme.test`, and how many for
-`platform@lms.test`? Write both numbers down, then check them against `06-SOLUTIONS-AND-REVIEW.md`.
+Run every check **from the repo root**:
 
-## Exercise 6 (red first): reintroduce the bug and measure it
+```
+node --experimental-transform-types --test ../m7-practice/<file>.test.mjs
+```
 
-Follow the "Break it first" steps in `04-TESTING-AND-DEBUGGING.md`. Before running anything, predict *which*
-of the 22 tests will fail and with what message. Then run
-`npx vitest run apps/api/src/api.test.ts apps/api/src/audit-scope.test.ts`, record the real failures, and
-restore the fix. Compare your prediction with the output: a prediction that named the wrong test is the most
-useful result you can get here, because it tells you which part of the path you had misread.
+(`--experimental-transform-types` rather than `--experimental-strip-types`
+because `errors.ts` uses constructor parameter properties.) Because the
+snapshot's relative imports resolve to `apps/api/src/`, the original and
+current services share one `store` module - which is what lets a single test
+compare them.
 
-## Exercise 7 (write path): audit ownership on a create
+## Exercise 1 - The dashboard matrix
 
-`POST /courses` writes a `course.created` audit row through `audit(...)` in `apps/api/src/store.ts`. Predict:
-if an Acme instructor creates a course and passes `organizationId: "org-acme"`, which organization ends up on
-the audit row - the actor's, or the one in the request body? Then answer the harder question: what happens
-today if a caller passes a *different* organization id in the body, and which function stops them? Name the
-file and line before you look. (Hint: `assertCanAuthorCourse` in `apps/api/src/policies.ts`.) Write a test that
-proves your answer; the shipped test in `audit-scope.test.ts` covers only the honest-caller case.
+**Goal:** know the dashboard audit projection for every role on the seeded
+store. Predict the `targetId` list for the Acme admin, the Acme instructor,
+the platform admin and the Acme learner.
+
+Save as `ex1-dashboard-matrix.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const { services } = await src('apps/api/src/services.ts');
+const { resetStore } = await src('apps/api/src/store.ts');
+
+const actor = (id, role, organizationId) => ({ id, role, organizationId });
+const targets = (a) => services.dashboard(a).auditLogs.map((log) => log.targetId);
+
+test('dashboard audit projection per actor on the seeded store', () => {
+  resetStore();
+  assert.deepEqual(targets(actor('user-admin', 'ORG_ADMIN', 'org-acme')), ['version-security-v1']);
+  assert.deepEqual(targets(actor('user-instructor', 'INSTRUCTOR', 'org-acme')), ['version-security-v1']);
+  assert.deepEqual(targets(actor('user-platform', 'PLATFORM_ADMIN', null)), ['version-security-v1', 'version-forklift-v1']);
+  assert.deepEqual(targets(actor('user-learner', 'LEARNER', 'org-acme')), []);
+});
+```
+
+**Check:** `# pass 1`. The instructor row is not covered by the Vitest suite
+(it only logs in the admin); this check is the evidence for it.
+
+## Exercise 2 - Filter before limit, measured on both versions
+
+**Goal:** with 26 Nova rows in front of 1 Acme row, predict how many rows and
+which organizations the Acme admin gets from the current code and from the
+original snapshot, and how many the platform admin gets.
+
+Save as `ex2-filter-before-limit.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const current = await src('apps/api/src/services.ts');
+const original = await src('astraupskill/snapshots/services-before.ts.txt'); // shares the same store module
+const { store, resetStore, seedAuditLogs } = await src('apps/api/src/store.ts');
+
+const acmeAdmin = { id: 'user-admin', role: 'ORG_ADMIN', organizationId: 'org-acme' };
+const platform = { id: 'user-platform', role: 'PLATFORM_ADMIN', organizationId: null };
+
+test('26 Nova rows in front of 1 Acme row', () => {
+  resetStore();
+  store.auditLogs.length = 0;
+  seedAuditLogs(1, 'org-acme');
+  seedAuditLogs(26, 'org-nova');
+  const orgs = (logs) => [...new Set(logs.map((log) => log.organizationId))];
+
+  assert.equal(current.services.dashboard(acmeAdmin).auditLogs.length, 1);
+  assert.deepEqual(orgs(current.services.dashboard(acmeAdmin).auditLogs), ['org-acme']);
+  assert.equal(current.services.dashboard(platform).auditLogs.length, 25);
+
+  const leaked = original.services.dashboard(acmeAdmin).auditLogs;
+  assert.equal(leaked.length, 25);
+  assert.deepEqual(orgs(leaked), ['org-nova']); // a leak AND a loss: zero Acme rows
+});
+```
+
+**Check:** `# pass 1`. Explain in one sentence why the original code returns
+no Acme row at all.
+
+## Exercise 3 - Would an agreement test have caught the bug?
+
+**Goal:** show that "both readers return the same ids" holds today and fails
+on the original code, without editing `src/`.
+
+Save as `ex3-agreement.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const current = await src('apps/api/src/services.ts');
+const original = await src('astraupskill/snapshots/services-before.ts.txt');
+const { resetStore } = await src('apps/api/src/store.ts');
+
+const acmeAdmin = { id: 'user-admin', role: 'ORG_ADMIN', organizationId: 'org-acme' };
+const ids = (svc) => ({
+  dashboard: svc.dashboard(acmeAdmin).auditLogs.map((log) => log.id),
+  endpoint: svc.auditLogs(acmeAdmin, { page: 1, pageSize: 25 }).auditLogs.map((log) => log.id),
+});
+
+test('current code: both readers return the same rows', () => {
+  resetStore();
+  const { dashboard, endpoint } = ids(current.services);
+  assert.deepEqual(dashboard, endpoint);
+});
+
+test('original code: the readers disagree, so an agreement test would have caught the bug', () => {
+  resetStore();
+  const { dashboard, endpoint } = ids(original.services);
+  assert.notDeepEqual(dashboard, endpoint);
+  assert.deepEqual(endpoint, ['audit-seeded-acme']);
+});
+```
+
+**Check:** `# pass 2`. Then answer: which of the four `audit-scope.test.ts`
+tests is this the service-level twin of?
+
+## Exercise 4 - Who stamps the organization on an audit row?
+
+**Goal:** predict the `organizationId` on the audit row when a platform admin
+(a) marks an Acme learner's lesson complete and (b) creates a course for
+`org-acme`, and whether the Acme admin can see each row. Read
+`services.ts:186` and `:150` first.
+
+Save as `ex4-audit-write-org.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const { services } = await src('apps/api/src/services.ts');
+const { store, resetStore } = await src('apps/api/src/store.ts');
+
+const acmeAdmin = { id: 'user-admin', role: 'ORG_ADMIN', organizationId: 'org-acme' };
+const platform = { id: 'user-platform', role: 'PLATFORM_ADMIN', organizationId: null };
+const acmeView = () => services.auditLogs(acmeAdmin, { page: 1, pageSize: 100 }).auditLogs.map((log) => log.id);
+
+test('a platform admin completing an Acme learner lesson writes an audit row Acme cannot see', () => {
+  resetStore();
+  services.completeLesson(platform, 'enroll-security-lena', 'lesson-data');
+  const row = store.auditLogs.find((log) => log.action === 'lesson.completed');
+  assert.equal(row.organizationId, null); // actor's org, not the enrollment's org
+  assert.ok(!acmeView().includes(row.id));
+});
+
+test('createCourse stamps the authorized body org, so the same admin action stays visible', () => {
+  resetStore();
+  const course = services.createCourse(platform, 'org-acme', 'Incident Drill', 'Practice reporting phishing.');
+  const row = store.auditLogs.find((log) => log.targetId === course.id);
+  assert.equal(row.organizationId, 'org-acme');
+  assert.ok(acmeView().includes(row.id));
+});
+```
+
+**Check:** `# pass 2`. Write the one-line fix for `completeLesson` (hint: the
+course is already reachable through `enrollmentContext`).
+
+## Exercise 5 - Status codes chosen by message text
+
+**Goal:** `toAppError` (`errors.ts:28-34`) maps errors by regex on the
+message. Predict the HTTP status for: publishing an already-published course;
+completing a lesson from another course version; an Acme instructor
+publishing Nova's `course-forklift`; the same instructor publishing a course
+id that does not exist.
+
+Save as `ex5-error-mapping.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const { services } = await src('apps/api/src/services.ts');
+const { resetStore } = await src('apps/api/src/store.ts');
+const { toAppError } = await src('apps/api/src/errors.ts');
+
+const status = (fn) => { try { fn(); return 'no error'; } catch (error) { return toAppError(error).statusCode; } };
+const acmeInstructor = { id: 'user-instructor', role: 'INSTRUCTOR', organizationId: 'org-acme' };
+const lena = { id: 'user-learner', role: 'LEARNER', organizationId: 'org-acme' };
+
+test('message-regex mapping turns state and validation errors into 403', () => {
+  resetStore();
+  // "Cannot publish course draft from PUBLISHED" matches /cannot/i
+  assert.equal(status(() => services.publishCourse(acmeInstructor, 'course-security')), 403);
+  // "Lesson does not belong to this enrollment version" matches /does not belong/i
+  assert.equal(status(() => services.completeLesson(lena, 'enroll-security-lena', 'lesson-inspection')), 403);
+});
+
+test('existence is checked before authorization: 404 vs 403 reveals another tenant course id', () => {
+  resetStore();
+  assert.equal(status(() => services.publishCourse(acmeInstructor, 'course-forklift')), 403); // exists, Nova
+  assert.equal(status(() => services.publishCourse(acmeInstructor, 'course-does-not-exist')), 404);
+});
+```
+
+**Check:** `# pass 2`. Name the status each of the first two cases *should*
+return and why (answer in 06).
+
+## Exercise 6 - Repeating a certificate request
+
+**Goal:** predict what two consecutive `POST
+/enrollments/enroll-security-lena/certificates` calls by Lena do to
+`store.certificates` (the seed already holds one certificate for her).
+
+Save as `ex6-certificate-repeat.test.mjs`:
+
+```js
+import './lms-loader.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+const src = (p) => import(pathToFileURL(process.cwd() + '/' + p).href);
+const { services } = await src('apps/api/src/services.ts');
+const { store, resetStore } = await src('apps/api/src/store.ts');
+
+const lena = { id: 'user-learner', role: 'LEARNER', organizationId: 'org-acme' };
+
+test('each certificate request appends a new ISSUED certificate', () => {
+  resetStore();
+  const first = services.issueCertificate(lena, 'enroll-security-lena');
+  const second = services.issueCertificate(lena, 'enroll-security-lena');
+  assert.equal(first.status, 'ISSUED');
+  assert.notEqual(first.verificationId, second.verificationId);
+  assert.equal(store.certificates.filter((c) => c.enrollmentId === 'enroll-security-lena').length, 3); // seed + 2
+});
+```
+
+**Check:** `# pass 1`. Then sketch the guard you would add and the test that
+proves a second call returns the existing certificate.

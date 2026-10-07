@@ -1,299 +1,128 @@
 # 06. Solutions and review
 
-This chapter answers the five exercises in 05-PRACTICE.md with source-grounded
-requests and assertions. The active test helpers are in
-apps/api/src/api.test.ts. The request helper creates the real Express app,
-listens on an ephemeral port, calls fetch, and closes the server:
+## Answers to 05
 
-~~~ts
-async function request(path: string, init?: RequestInit) {
-  const app = createApp();
-  const server = app.listen(0);
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  try {
-    return await fetch("http://127.0.0.1:" + port + path, init);
-  } finally {
-    server.close();
-  }
-}
-~~~
+**Exercise 1.** Acme admin and Acme instructor: `["version-security-v1"]`
+only - both roles take the same non-platform branch of `auditLogScope`.
+Platform admin: both seeded targets, newest first (`unshift` order). Learner:
+`[]` with status 200, even though the store holds rows; the learner branch
+returns before the predicate runs. The dedicated endpoint answers the learner
+with 403 instead - two contracts, both tested (`api.test.ts:35-58` and
+`:139-144`).
 
-Place these examples in `apps/api/src/api.test.ts`, reusing its existing
-imports and `request` helper. Add the store import for the ordering exercise:
+**Exercise 2.** Current code: Acme admin gets 1 row (Acme), platform admin
+gets 25 of the 27 rows. Original code: `store.auditLogs.slice(0, 25)` takes
+the 25 newest rows, all of them Nova, and applies no filter, so the Acme admin
+receives 25 foreign rows and none of their own - a leak and a loss at once.
+If the original had filtered *after* slicing, it would have returned zero
+rows: no leak, but the owner's row silently disappears.
 
-~~~ts
-import { describe, expect, it } from "vitest";
-import { createApp } from "./index.js";
-import { store } from "./store.js";
-~~~
+**Exercise 3.** It is the service-level twin of the agreement test,
+`audit-scope.test.ts:31-42`. Against the original code the endpoint returns
+`["audit-seeded-acme"]` while the dashboard returns both seeded rows, so the
+agreement assertion alone would have caught the bug.
 
-The seeded password is password123. The dashboard endpoint is
-GET /me/dashboard, and login is POST /auth/login with JSON credentials. A
-small reusable login helper makes each answer executable:
+**Exercise 4.** (a) `null` - `completeLesson` stamps `actor.organizationId`
+(`services.ts:186`), and a platform admin has none, so the Acme admin's view
+never contains a record of someone changing an Acme learner's progress.
+(b) `org-acme` - `createCourse` stamps the body's `organizationId`
+(`services.ts:150`), which `assertCanAuthorCourse` has just authorized. Fix
+for (a): destructure `course` from `enrollmentContext(enrollmentId)` at line
+174 and call `audit(actor.id, course.organizationId, "lesson.completed", ...)`.
+See finding 1.
 
-~~~ts
-async function tokenFor(email: string) {
-  const response = await request("/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password: "password123" }),
-  });
-  expect(response.status).toBe(200);
-  return (await response.json() as { token: string }).token;
-}
+**Exercise 5.** Today all four are 403, 403, 403, 404. Better: publishing an
+already-published course is a state conflict (409); a lesson from another
+version is invalid input (400 or 422), not a permission failure; and the last
+two should be indistinguishable (both 404, or both 403). See findings 2 and 3.
 
-async function dashboardFor(email: string) {
-  const token = await tokenFor(email);
-  const response = await request("/me/dashboard", {
-    headers: { Authorization: "Bearer " + token },
-  });
-  expect(response.status).toBe(200);
-  return await response.json() as {
-    auditLogs: { organizationId: string | null; targetId: string }[];
-    courses: unknown[];
-  };
-}
-~~~
+**Exercise 6.** Each call appends a new `ISSUED` certificate with a new
+`verificationId`, so Lena ends up with three. A guard at the top of
+`issueCertificate` would return the existing `ISSUED` certificate for the
+enrollment; the test calls twice and asserts the same `verificationId` and an
+unchanged count. See finding 4.
 
-Exercise 1 asks for an Acme staff response. The concrete existing regression
-uses admin@acme.test, which has ORG_ADMIN role and organizationId org-acme:
+The break-it drill's answer (three red tests, which ones, and why the learner
+assertion stays green) is in 04, "Break it first".
 
-~~~ts
-it("keeps Acme dashboard logs in Acme", async () => {
-  const result = await dashboardFor("admin@acme.test");
-  expect(result.courses.length).toBeGreaterThan(0);
-  expect(result.auditLogs.length).toBeGreaterThan(0);
-  expect(result.auditLogs.every((log) => log.organizationId === "org-acme")).toBe(true);
-  expect(result.auditLogs.map((log) => log.targetId))
-    .not.toContain("version-forklift-v1");
-});
-~~~
+## Review findings still open in the code
 
-The answer is the Acme seeded target, version-security-v1, and no Nova target.
-An instructor has the same organization policy in services.ts, but this exact
-regression uses the seeded admin. An instructor example can be added with
-dashboardFor("instructor@acme.test"); it should receive the same organization
-scope, though that role is not the assertion reported by the current suite.
+Each was verified by reading the cited lines; findings 1-4 are also
+demonstrated by the 05 checks.
 
-Exercise 2 asks why a platform administrator sees both organizations. The
-answer is the explicit PLATFORM_ADMIN branch in visibleAuditLogs. The
-existing HTTP assertion uses the real seeded platform identity:
+### 1. Audit rows stamped with the actor's tenant, not the resource's
 
-~~~ts
-it("keeps platform dashboard visibility global", async () => {
-  const result = await dashboardFor("platform@lms.test");
-  expect(result.auditLogs.map((log) => log.targetId))
-    .toEqual(expect.arrayContaining(["version-security-v1", "version-forklift-v1"]));
-});
-~~~
+`completeLesson`, `submitQuiz` and `submitAssignment` call
+`audit(actor.id, actor.organizationId, ...)` (`services.ts:186, 200, 212`).
+For a learner the two values coincide, because `enroll` requires
+`canLearnInOrganization` (`services.ts:167`). But
+`assertCanAccessOwnLearnerRecord` (`policies.ts:22-26`) lets a
+`PLATFORM_ADMIN` complete any learner's lesson, and that row gets
+`organizationId: null` - invisible to the tenant whose data changed. The
+course's fix scoped the *readers*; this is the matching *writer* defect.
+Severity: medium (compliance trail gap, no data exposure).
 
-This is a deliberate exception. Do not “fix” the leak by filtering every
-actor against one organization; that would break platform operations.
+### 2. Error status chosen by regex over the message
 
-Exercise 3 asks for the learner shape. The exact answer is an HTTP 200 JSON
-dashboard whose auditLogs property is an empty array, even though the store
-contains events:
+`toAppError` (`errors.ts:31-32`) returns 404 for any message containing "not
+found" and 403 for "forbidden", "does not belong", "cannot" or "only the".
+Consequences:
 
-~~~ts
-it("returns an empty audit projection to learners", async () => {
-  const result = await dashboardFor("learner@acme.test");
-  expect(result.auditLogs).toEqual([]);
-});
-~~~
+- `publishDraft` throws `Cannot publish course draft from PUBLISHED`
+  (`packages/domain/src/index.ts:29`) -> 403 instead of 409. Because nothing
+  ever moves a course back to `DRAFT`, the version-numbering expression at
+  `services.ts:158` can only ever produce version 1 through the API.
+- `Lesson does not belong to this enrollment version` (`services.ts:177`) ->
+  403, and `api.test.ts:98-107` pins that 403, so the test encodes the
+  misclassification.
+- `gradeQuiz`'s `Quiz score must be between 0 and 100`
+  (`domain/src/index.ts:40`) matches nothing -> 500 for a data problem.
+- Rewording any message silently changes the HTTP contract.
 
-The dedicated GET /audit-logs endpoint remains separately forbidden for a
-learner. The dashboard contract is an empty projection, so these are two
-different tested response behaviors.
+Fix direction: throw typed errors (`ConflictError`, `ValidationError`
+already exists at `errors.ts:22-26`) and map by class, not text.
 
-Exercise 4 is a proposed ordering test, not part of the recorded nineteen
-tests. It asks whether a local event survives twenty-six foreign events.
-Because apps/api/src/store.ts exports the in-memory store, a focused test can
-save the original array, prepend synthetic Nova records, call the same
-dashboard request, and restore it in a finally block:
+### 3. Existence checked before authorization (id oracle)
 
-~~~ts
-it("filters organization records before limiting the dashboard", async () => {
-const original = store.auditLogs.slice();
-try {
-  for (let index = 0; index < 26; index += 1) {
-    store.auditLogs.unshift({
-      id: "nova-" + index,
-      organizationId: "org-nova",
-      actorId: "user-platform",
-      action: "course.published",
-      targetType: "CourseVersion",
-      targetId: "nova-" + index,
-      metadata: { exercise: "limit-order" },
-      createdAt: new Date(index).toISOString(),
-    });
-  }
-  const result = await dashboardFor("admin@acme.test");
-  expect(result.auditLogs.length).toBeGreaterThan(0);
-  expect(result.auditLogs.map((log) => log.targetId)).toContain("version-security-v1");
-  expect(result.auditLogs.every((log) => log.organizationId === "org-acme")).toBe(true);
-} finally {
-  store.auditLogs.splice(0, store.auditLogs.length, ...original);
-}
-});
-~~~
+`publishCourse` returns 404 for an unknown id but 403 for another tenant's
+course (`services.ts:154-156`): the lookup happens before
+`assertCanAuthorCourse`. The same order appears in `enroll` (164-167),
+`completeLesson` (174-176) and `gradeAssignment` (216-220). Seeded ids are
+readable slugs (`course-forklift`), so an Acme user can confirm which ids
+exist in Nova. Fix: resolve the resource *within* the actor's visible scope
+and return the same 404 when it is absent or foreign.
 
-The expected result is the Acme event, because the staff branch filters by
-organizationId before slice(0, 25). This proposed test must restore the
-singleton; otherwise later tests inherit its records. It is an additional
-exercise, not evidence included in the nineteen-test result.
-The explicit nonempty and local-target assertions are essential: an empty
-array passes `every`, so ownership alone would not catch slicing the first
-twenty-five foreign records before filtering. The `it` callback also keeps
-the asynchronous request inside a registered test rather than executing it
-while the suite is being defined.
+### 4. Certificate issuance is not idempotent
 
-Exercise 5 asks for agreement with the dedicated endpoint. Both paths should
-use organizationId for ordinary staff, while platform administrators retain
-global visibility and learners have the documented dashboard empty result.
-The dedicated endpoint additionally supports action, targetType, page and
-pageSize filters. The dashboard is a fixed first page. Review the code rather
-than assuming identical JSON shapes: services.auditLogs returns
-{ auditLogs, pagination }, while services.dashboard returns auditLogs as one
-field of a larger snapshot.
+`issueCertificate` (`services.ts:227-242`) always pushes a new certificate,
+`ISSUED` or `PENDING`, with a fresh `verificationId`. Retries or double clicks
+create multiple valid public verification links for one enrollment, and the
+public `GET /certificates/verify/:id` (`index.ts:33-37`,
+`services.ts:119-133`) returns the learner's name for every one of them,
+including `PENDING` records. Fix: return the existing `ISSUED` certificate,
+and decide whether `PENDING` rows should be stored at all.
 
-The full policy matrix is:
+### 5. Teaching-grade credentials
 
-| Actor and seeded identity | Dashboard audit result |
-| --- | --- |
-| Acme ORG_ADMIN admin@acme.test | Acme records only |
-| Acme INSTRUCTOR instructor@acme.test | Acme records only; role inferred from the same organization branch |
-| PLATFORM_ADMIN platform@lms.test | Acme and Nova records |
-| Acme LEARNER learner@acme.test | [] |
+`services.login` compares plaintext passwords (`services.ts:55`; the `User`
+type stores `password: string`, `store.ts:4`). `bcryptjs` is declared in both
+`package.json` files but imported nowhere. `JWT_SECRET` defaults to
+`"local-learning-secret"` (`packages/config/src/index.ts:6`), so any process
+started without that variable accepts tokens anyone can sign, for example
+with `sub: "user-platform"`. Fine for a local demo; a blocker for any shared
+deployment. Fix: hash at seed time and compare with `bcrypt.compare`; make
+`JWT_SECRET` required outside `NODE_ENV=development|test`.
 
-The repair is complete when the ordinary branch applies
-filter(log.organizationId === actor.organizationId) before slice, the platform
-branch remains global, and the learner branch remains empty. The source
-snapshot services-before.ts.txt shows the former global expression. The actual
-API test invokes login and /me/dashboard, so it would fail against that
-expression when both seeded records occupy the first page. The test proves
-local in-memory response selection and JWT wiring; it does not prove
-row-level security in a persistent database, production identity assurance,
-browser rendering, or external audit delivery.
+### 6. Duplicate enrollments
 
-## Exercise 4, as the shipped test states it
+`enroll` (`services.ts:163-172`) never checks for an existing enrollment for
+the same learner and version, so repeated calls create parallel enrollments
+with separate progress. Low severity here; in a database this becomes a
+unique constraint on `(learnerId, courseVersionId)`.
 
-The assertion is not "the dashboard hides Nova rows"; it is that two endpoints return the same row IDs for the same actor, checked for a tenant admin and for the platform admin. From `apps/api/src/audit-scope.test.ts:31-42`:
+## What the shipped tests do and do not prove
 
-```ts
-  it("returns the same audit rows on the dashboard and on /audit-logs for the same actor", async () => {
-    for (const email of ["admin@acme.test", "platform@lms.test"]) {
-      const token = await login(email);
-      const dashboard = await request("/me/dashboard", { headers: { Authorization: `Bearer ${token}` } });
-      const dashboardBody = await dashboard.json() as { auditLogs: AuditRow[] };
-      const endpoint = await request("/audit-logs?page=1&pageSize=25", { headers: { Authorization: `Bearer ${token}` } });
-      const endpointBody = await endpoint.json() as { auditLogs: AuditRow[] };
-      expect(dashboard.status).toBe(200);
-      expect(endpoint.status).toBe(200);
-      expect(dashboardBody.auditLogs.map((log) => log.id)).toEqual(endpointBody.auditLogs.map((log) => log.id));
-    }
-  });
-```
-
-## Exercise 4, answered against the shipped test
-
-Exercise 4 is no longer "proposed": it is the second test in `apps/api/src/audit-scope.test.ts` and it is part
-of the recorded 22-test run.
-
-~~~ts
-it("filters by owner before applying the page limit, so a noisy tenant cannot push an owner's row off page one", async () => {
-  resetStore();
-  store.auditLogs.length = 0;
-  seedAuditLogs(1, "org-acme");
-  seedAuditLogs(26, "org-nova");
-
-  const token = await login("admin@acme.test");
-  const dashboard = await request("/me/dashboard", { headers: { Authorization: `Bearer ${token}` } });
-  const body = await dashboard.json() as { auditLogs: AuditRow[] };
-  expect(body.auditLogs).toHaveLength(1);
-  expect(body.auditLogs[0]!.organizationId).toBe("org-acme");
-
-  const platformToken = await login("platform@lms.test");
-  const platformDashboard = await request("/me/dashboard", { headers: { Authorization: `Bearer ${platformToken}` } });
-  const platformBody = await platformDashboard.json() as { auditLogs: AuditRow[] };
-  expect(platformBody.auditLogs).toHaveLength(25);
-});
-~~~
-
-**Answers.** The Acme admin gets exactly **1** row. The platform admin gets exactly **25** - the limit, out of
-27 stored rows - because the platform branch of `auditLogScope` admits everything and only then does
-`slice(0, 25)` apply. Under the old, unscoped code the Acme admin would have received 25 Nova rows and zero of
-their own, which is both a leak and a loss. `resetStore()` in `afterEach` puts the seeded fixture back, so no
-later test inherits the 27 synthetic rows.
-
-## Exercise 5, answered: one predicate, one test
-
-The agreement is now enforced rather than assumed:
-
-~~~ts
-it("returns the same audit rows on the dashboard and on /audit-logs for the same actor", async () => {
-  for (const email of ["admin@acme.test", "platform@lms.test"]) {
-    const token = await login(email);
-    const dashboard = await request("/me/dashboard", { headers: { Authorization: `Bearer ${token}` } });
-    const endpoint = await request("/audit-logs?page=1&pageSize=25", { headers: { Authorization: `Bearer ${token}` } });
-    expect(((await dashboard.json()) as any).auditLogs.map((l: AuditRow) => l.id))
-      .toEqual(((await endpoint.json()) as any).auditLogs.map((l: AuditRow) => l.id));
-  }
-});
-~~~
-
-The shapes still differ (`{ auditLogs, pagination }` versus `auditLogs` inside a larger snapshot) and the
-learner rule still differs (403 versus `[]`), so the test compares the **row ids**, which is the part that must
-never diverge. The reviewer's expectation, stated precisely: *the ownership predicate is one exported function
-that both readers call, and a test fails if either reader stops calling it.*
-
-## Exercise 6, answered: what actually turns red
-
-Putting the unscoped `slice(0, 25)` back and running
-`npx vitest run apps/api/src/api.test.ts apps/api/src/audit-scope.test.ts` turns these red:
-
-- `api.test.ts > scopes dashboard audit logs by organization while platform admins see both tenants` - on
-  `expect(adminResult.auditLogs.every((log) => log.organizationId === "org-acme")).toBe(true)`, because the
-  Nova seeded row is now in the Acme admin's list.
-- `audit-scope.test.ts > filters by owner before applying the page limit...` - the Acme admin receives 25 rows
-  (all Nova) instead of 1.
-- `audit-scope.test.ts > returns the same audit rows on the dashboard and on /audit-logs...` - the dashboard
-  now returns global rows while `/audit-logs` is still scoped, so the id lists differ.
-
-The learner assertion stays green: the `LEARNER` early return is untouched by that edit. If your prediction
-missed that, the lesson is that a single expression change usually breaks a *subset* of the tests, and the
-subset tells you exactly which contract the expression owned.
-
-## Exercise 7, answered: the actor wins, and a policy enforces it
-
-The audit row carries `org-acme` because `services.createCourse` calls
-`audit(actor.id, organizationId, "course.created", ...)` with the organization it just authorized - and the
-authorization is `assertCanAuthorCourse(actor, organizationId)` (`apps/api/src/policies.ts:10`), which delegates
-to `canAuthorCourse` (`packages/domain/src/index.ts:19`):
-
-~~~ts
-return actor.role === "PLATFORM_ADMIN"
-  || ((actor.role === "INSTRUCTOR" || actor.role === "ORG_ADMIN") && actor.organizationId === organizationId);
-~~~
-
-So a body-supplied organization id is *checked against the actor* before anything is written; an Acme
-instructor sending `organizationId: "org-nova"` gets a `ForbiddenError` and no course and no audit row. The
-general rule: a request body may *name* a tenant, but the tenant must be re-derived from, or validated against,
-the authenticated actor before any write. The shipped test then closes the loop by showing the row is readable
-by the Acme admin and excluded by `auditLogScope` for a Nova admin - the writer and the reader use the same
-boundary.
-
-A test for the rejected case is a good five-minute follow-on:
-
-~~~ts
-it("refuses to write an audit row for another organization", async () => {
-  const token = await login("instructor@acme.test");
-  const response = await request("/courses", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ organizationId: "org-nova", title: "Cross tenant", summary: "Should not be created." })
-  });
-  expect(response.status).toBe(403);
-  expect(store.auditLogs.some((log) => log.action === "course.created" && log.organizationId === "org-nova")).toBe(false);
-});
-~~~
+They prove response selection and the write-path tenant check for the tested
+actors over the in-memory store, through real HTTP. They do not prove
+row-level security in a database, behavior after restart, browser rendering,
+or any of findings 1-6.
